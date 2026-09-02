@@ -164,9 +164,6 @@ def frame(steps, summary, theme, live=None, outcome=True, cmd="claude-desktop-up
         dind = ind + "    "
         for lvl, msg in details:
             body.append(detail_line(dind, lvl, msg)); y += LH
-    if post:
-        for lvl, msg in post:
-            body.append(detail_line("      ", lvl, msg)); y += LH
         if active:
             pct, detail = live[1], live[2]
             width = 34
@@ -176,6 +173,9 @@ def frame(steps, summary, theme, live=None, outcome=True, cmd="claude-desktop-up
                                     (bar[:filled + 1], T["accent"], False), (bar[filled + 1:], T["bar_empty"], False),
                                     (f" {pct:5.1f}%  ", T["fg"], False), (detail, T["dim"], False)]))
             y += LH
+    if post:
+        for lvl, msg in post:
+            body.append(detail_line("      ", lvl, msg)); y += LH
 
     if outcome and live is None:
         total = (steps[-1]["end"] - steps[0]["start"]).total_seconds()
