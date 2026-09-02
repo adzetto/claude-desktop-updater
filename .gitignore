@@ -1,0 +1,6 @@
+dist/
+*.msix
+*.log
+*.tmp
+__pycache__/
+.vs/

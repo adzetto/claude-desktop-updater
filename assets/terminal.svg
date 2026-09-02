@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 874" width="900" height="874" font-family="Cascadia Code, JetBrains Mono, Consolas, monospace" font-size="13">
+<rect width="900" height="874" rx="12" fill="#0B0F19"/>
+<path d="M0 12a12 12 0 0 1 12-12h876a12 12 0 0 1 12 12v28H0z" fill="#141A26"/>
+<circle cx="22" cy="20" r="6" fill="#FF5F57"/><circle cx="42" cy="20" r="6" fill="#FEBC2E"/><circle cx="62" cy="20" r="6" fill="#28C840"/>
+<text x="450.0" y="25" text-anchor="middle" fill="#8B949E" font-size="12">claude-desktop-updater</text>
+<text x="22" y="77" fill="#8B949E">PS C:\Users\you&gt; <tspan fill="#E6EDF3">claude-desktop-updater</tspan></text>
+<text x="22" y="96" fill="#9B7BFF" xml:space="preserve">  ╭<tspan fill="#9B7BFF">──────────────────────────────────────────────────────────</tspan>╮</text>
+<text x="22" y="115" fill="#9B7BFF" xml:space="preserve">  │  <tspan fill="#F5A623" font-weight="bold"> CLAUDE DESKTOP UPDATER</tspan>                                 │</text>
+<text x="22" y="134" fill="#9B7BFF" xml:space="preserve">  │<tspan fill="#E6EDF3">   MSIX repair and update tool for Windows                </tspan>│</text>
+<text x="22" y="153" fill="#9B7BFF" xml:space="preserve">  │<tspan fill="#8B949E">   v3.0.0   github.com/adzetto/claude-desktop-updater     </tspan>│</text>
+<text x="22" y="172" fill="#9B7BFF" xml:space="preserve">  ╰<tspan fill="#9B7BFF">──────────────────────────────────────────────────────────</tspan>╯</text>
+<text x="22" y="195" xml:space="preserve"><tspan fill="#8B949E">  06:22:42   </tspan><tspan fill="#8B949E"> </tspan>  <tspan fill="#8B949E">sc delete as administrator: [SC] OpenService FAILED 5:  Access is denied. </tspan></text>
+<text x="22" y="214" xml:space="preserve"><tspan fill="#8B949E">  06:22:52   </tspan><tspan fill="#8B949E"> </tspan>  <tspan fill="#8B949E">sc delete as SYSTEM: [SC] SetServiceObjectSecurity FAILED 2: | The system cannot find the file specified. | [S</tspan></text>
+<text x="22" y="233" xml:space="preserve"><tspan fill="#8B949E">  06:22:52   </tspan><tspan fill="#FFC846">▲</tspan>  <tspan fill="#FFC846">Service removal is pending a reboot; the package cannot register its service until then</tspan></text>
+<text x="22" y="258" xml:space="preserve"><tspan fill="#8B949E">  06:22:52 </tspan><tspan fill="#9B7BFF">[1/14]</tspan> <tspan fill="#E6EDF3" font-weight="bold">Verifying sideloading policy</tspan></text>
+<text x="22" y="277" xml:space="preserve"><tspan fill="#8B949E">  06:22:52   </tspan><tspan fill="#8B949E"> </tspan>  <tspan fill="#8B949E">AppModelUnlock keys set</tspan></text>
+<text x="22" y="296" xml:space="preserve"><tspan fill="#8B949E">  06:22:52   </tspan><tspan fill="#50DC78">✔</tspan>  <tspan fill="#E6EDF3">Policy keys allow sideloading</tspan></text>
+<text x="22" y="321" xml:space="preserve"><tspan fill="#8B949E">  06:22:52 </tspan><tspan fill="#9B7BFF">[2/14]</tspan> <tspan fill="#E6EDF3" font-weight="bold">Removing existing Claude package registrations</tspan></text>
+<text x="22" y="340" xml:space="preserve"><tspan fill="#8B949E">  06:22:52   </tspan><tspan fill="#50DC78">✔</tspan>  <tspan fill="#E6EDF3">No package installed</tspan></text>
+<text x="22" y="365" xml:space="preserve"><tspan fill="#8B949E">  06:22:52 </tspan><tspan fill="#9B7BFF">[3/14]</tspan> <tspan fill="#E6EDF3" font-weight="bold">Cleaning leftovers (user data: preserved)</tspan></text>
+<text x="22" y="384" xml:space="preserve"><tspan fill="#8B949E">  06:22:54   </tspan><tspan fill="#8B949E"> </tspan>  <tspan fill="#8B949E">Removed winget registration Anthropic.Claude</tspan></text>
+<text x="22" y="403" xml:space="preserve"><tspan fill="#8B949E">  06:22:54   </tspan><tspan fill="#50DC78">✔</tspan>  <tspan fill="#E6EDF3">1 item(s) cleaned</tspan></text>
+<text x="22" y="422" xml:space="preserve"><tspan fill="#8B949E">  06:22:54   </tspan><tspan fill="#FF5F5F">✖</tspan>  <tspan fill="#FF5F5F">Skipping installation: the stale service entry disappears only after a reboot</tspan></text>
+<text x="22" y="447" xml:space="preserve"><tspan fill="#8B949E">  06:24:32 </tspan><tspan fill="#9B7BFF">[4/14]</tspan> <tspan fill="#E6EDF3" font-weight="bold">Stopping Claude Desktop processes</tspan></text>
+<text x="22" y="466" xml:space="preserve"><tspan fill="#8B949E">  06:24:32   </tspan><tspan fill="#8B949E"> </tspan>  <tspan fill="#8B949E">6 other 'claude' process(es) left untouched (Claude Code CLI)</tspan></text>
+<text x="22" y="485" xml:space="preserve"><tspan fill="#8B949E">  06:24:32   </tspan><tspan fill="#50DC78">✔</tspan>  <tspan fill="#E6EDF3">0 Claude Desktop process(es) stopped</tspan></text>
+<text x="22" y="510" xml:space="preserve"><tspan fill="#8B949E">  06:24:32 </tspan><tspan fill="#9B7BFF">[5/14]</tspan> <tspan fill="#E6EDF3" font-weight="bold">Checking for a stale CoworkVMService</tspan></text>
+<text x="22" y="529" xml:space="preserve"><tspan fill="#8B949E">  06:24:32   </tspan><tspan fill="#FFC846">▲</tspan>  <tspan fill="#FFC846">Service is known to the SCM but its registry key is missing; recreating the key skeleton</tspan></text>
+<text x="22" y="548" xml:space="preserve"><tspan fill="#8B949E">  06:24:32   </tspan><tspan fill="#8B949E"> </tspan>  <tspan fill="#8B949E">sc delete as administrator: [SC] OpenService FAILED 5:  Access is denied. </tspan></text>
+<text x="22" y="567" xml:space="preserve"><tspan fill="#8B949E">  06:24:33   </tspan><tspan fill="#8B949E"> </tspan>  <tspan fill="#8B949E">sc delete as SYSTEM: [SC] SetServiceObjectSecurity SUCCESS | [SC] DeleteService SUCCESS</tspan></text>
+<text x="22" y="586" xml:space="preserve"><tspan fill="#8B949E">  06:24:33   </tspan><tspan fill="#50DC78">✔</tspan>  <tspan fill="#E6EDF3">CoworkVMService removed (SYSTEM context)</tspan></text>
+<text x="22" y="611" xml:space="preserve"><tspan fill="#8B949E">  06:24:33 </tspan><tspan fill="#9B7BFF">[6/14]</tspan> <tspan fill="#E6EDF3" font-weight="bold">Verifying sideloading policy</tspan></text>
+<text x="22" y="630" xml:space="preserve"><tspan fill="#8B949E">  06:24:33   </tspan><tspan fill="#8B949E"> </tspan>  <tspan fill="#8B949E">AppModelUnlock keys set</tspan></text>
+<text x="22" y="649" xml:space="preserve"><tspan fill="#8B949E">  06:24:33   </tspan><tspan fill="#50DC78">✔</tspan>  <tspan fill="#E6EDF3">Policy keys allow sideloading</tspan></text>
+<text x="22" y="674" xml:space="preserve"><tspan fill="#8B949E">  06:24:33 </tspan><tspan fill="#9B7BFF">[7/14]</tspan> <tspan fill="#E6EDF3" font-weight="bold">Removing existing Claude package registrations</tspan></text>
+<text x="22" y="693" xml:space="preserve"><tspan fill="#8B949E">  06:24:33   </tspan><tspan fill="#50DC78">✔</tspan>  <tspan fill="#E6EDF3">No package installed</tspan></text>
+<text x="22" y="718" xml:space="preserve"><tspan fill="#8B949E">  06:24:33 </tspan><tspan fill="#9B7BFF">[8/14]</tspan> <tspan fill="#E6EDF3" font-weight="bold">Cleaning leftovers (user data: preserved)</tspan></text>
+<text x="22" y="737" xml:space="preserve"><tspan fill="#8B949E">  06:24:35   </tspan><tspan fill="#8B949E"> </tspan>  <tspan fill="#8B949E">Removed winget registration Anthropic.Claude</tspan></text>
+<text x="22" y="756" xml:space="preserve"><tspan fill="#8B949E">  06:24:35   </tspan><tspan fill="#50DC78">✔</tspan>  <tspan fill="#E6EDF3">1 item(s) cleaned</tspan></text>
+<text x="22" y="781" xml:space="preserve"><tspan fill="#8B949E">  06:24:35 </tspan><tspan fill="#9B7BFF">[9/14]</tspan> <tspan fill="#E6EDF3" font-weight="bold">Installing package</tspan></text>
+<text x="22" y="800" xml:space="preserve"><tspan fill="#8B949E">  06:24:37   </tspan><tspan fill="#50DC78">✔</tspan>  <tspan fill="#E6EDF3">Authenticode signature valid: CN="Anthropic</tspan></text>
+<text x="22" y="819" xml:space="preserve"><tspan fill="#8B949E">  06:24:42   </tspan><tspan fill="#50DC78">✔</tspan>  <tspan fill="#E6EDF3">Installed version 1.40609.1.0</tspan></text>
+<text x="22" y="838" xml:space="preserve"><tspan fill="#8B949E">  06:24:42   </tspan><tspan fill="#8B949E">❯</tspan>  <tspan fill="#8B949E">Elevated phase finished with exit code 0</tspan></text>
+<text x="22" y="857" xml:space="preserve"><tspan fill="#8B949E">  06:24:42   </tspan><tspan fill="#50DC78">✔</tspan>  <tspan fill="#E6EDF3">Claude Desktop launched</tspan></text>
+<text x="22" y="876" xml:space="preserve"><tspan fill="#8B949E">  06:24:42   </tspan><tspan fill="#8B949E">❯</tspan>  <tspan fill="#8B949E">SUMMARY: not installed -&gt; 1.40609.1.0</tspan></text>
+</svg>
