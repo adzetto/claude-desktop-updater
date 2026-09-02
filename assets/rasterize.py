@@ -1,15 +1,16 @@
-"""Rasterise the procedural logo with numpy (no SVG renderer needed).
+"""Rasterise the mark with numpy (no SVG renderer needed).
 
-Reuses the exact geometry from make_logo.py and paints it into an RGBA
-array with anti-aliased circle coverage, then writes logo.png (512 px),
-a README preview and icon.ico (256/128/64/48/32/16) via Pillow.
+Reuses the geometry from make_logo.py, paints it with anti-aliased signed
+distance coverage into an RGBA array, and writes logo.png (512 px) plus a
+multi-size icon.ico through Pillow.
 
 Run:  python assets/rasterize.py
 """
-import numpy as np
-from pathlib import Path
-from PIL import Image
 import importlib.util
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
 
 here = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("make_logo", here / "make_logo.py")
@@ -21,74 +22,62 @@ yy, xx = np.mgrid[0:S, 0:S].astype(float) + 0.5
 img = np.zeros((S, S, 4), float)
 
 
-def blend(cov, rgb, a):
-    """Alpha-composite a coverage mask with colour rgb (0..255) and alpha a."""
-    a_src = (cov * a)[..., None]
-    img[..., :3] = img[..., :3] * (1 - a_src) + np.asarray(rgb, float) * a_src
-    img[..., 3:] = img[..., 3:] * (1 - a_src) + a_src
+def hex_rgb(h):
+    return np.array([int(h[i:i + 2], 16) for i in (1, 3, 5)], float)
 
 
-def disc(cx, cy, r):
-    d = np.hypot(xx - cx, yy - cy)
-    return np.clip(r + 0.5 - d, 0.0, 1.0)          # 1 px anti-aliased edge
+def blend(cov, rgb):
+    a = cov[..., None]
+    img[..., :3] = img[..., :3] * (1 - a) + rgb * a
+    img[..., 3:] = img[..., 3:] * (1 - a) + a
 
 
-def segment(x0, y0, x1, y1, w):
-    px, py = x1 - x0, y1 - y0
+def stroke_cov(dist, width):
+    """coverage of a stroke of the given width from a signed distance field"""
+    return np.clip(width / 2 + 0.5 - dist, 0.0, 1.0)
+
+
+def seg_dist(P, Q):
+    px, py = Q[0] - P[0], Q[1] - P[1]
     L2 = px * px + py * py
-    t = np.clip(((xx - x0) * px + (yy - y0) * py) / L2, 0.0, 1.0)
-    d = np.hypot(xx - (x0 + t * px), yy - (y0 + t * py))
-    return np.clip(w / 2 + 0.5 - d, 0.0, 1.0)
+    t = np.clip(((xx - P[0]) * px + (yy - P[1]) * py) / L2, 0.0, 1.0)
+    return np.hypot(xx - (P[0] + t * px), yy - (P[1] + t * py))
 
 
-def polygon(P):
-    inside = np.zeros((S, S), bool)
-    n = len(P)
-    for i in range(n):
-        (x0, y0), (x1, y1) = P[i], P[(i + 1) % n]
-        cond = ((y0 > yy) != (y1 > yy)) & (xx < (x1 - x0) * (yy - y0) / (y1 - y0 + 1e-12) + x0)
-        inside ^= cond
-    return inside.astype(float)
+def polyline_dist(pts):
+    d = np.full((S, S), np.inf)
+    for a, b in zip(pts[:-1], pts[1:]):
+        d = np.minimum(d, seg_dist(a, b))
+    return d
 
 
-# background: dark rounded card
-rr = 96.0
-corner = np.minimum.reduce([disc(rr, rr, rr), disc(S - rr, rr, rr), disc(rr, S - rr, rr), disc(S - rr, S - rr, rr)])
-card = ((xx >= rr) & (xx <= S - rr)) | ((yy >= rr) & (yy <= S - rr))
-card = np.maximum(card.astype(float), np.maximum.reduce([disc(rr, rr, rr), disc(S - rr, rr, rr), disc(rr, S - rr, rr), disc(S - rr, S - rr, rr)]))
-blend(card, (0x0B, 0x0F, 0x19), 1.0)
+# rounded card
+r = 112.0
+inner_x = (xx >= r) & (xx <= S - r)
+inner_y = (yy >= r) & (yy <= S - r)
+card = (inner_x | inner_y).astype(float)
+for cx_, cy_ in ((r, r), (S - r, r), (r, S - r), (S - r, S - r)):
+    card = np.maximum(card, np.clip(r + 0.5 - np.hypot(xx - cx_, yy - cy_), 0, 1))
+blend(card, hex_rgb(logo.DARK))
 
-# glow
-d = np.hypot(xx - logo.cx, yy - logo.cy) / 230.0
-blend(np.clip(1 - d, 0, 1) ** 2, (0x6C, 0x5C, 0xE7), 0.35)
+# ring as an arc: distance to the circle, masked to the open angular range
+ang = np.arctan2(yy - logo.cy, xx - logo.cx)
+ring_d = np.abs(np.hypot(xx - logo.cx, yy - logo.cy) - logo.R)
+in_arc = ((ang - logo.start) % (2 * np.pi)) <= (logo.end - logo.start)
+arc_d = np.where(in_arc, ring_d, np.inf)
+# round caps at both ends
+for a in (logo.start, logo.end):
+    cap = np.hypot(xx - (logo.cx + logo.R * np.cos(a)), yy - (logo.cy + logo.R * np.sin(a)))
+    arc_d = np.minimum(arc_d, cap)
+blend(stroke_cov(arc_d, logo.W), hex_rgb(logo.ACCENT))
 
-# lattice, back to front
-for i in np.argsort(-logo.r):
-    blend(disc(logo.x[i], logo.y[i], logo.dot[i]), logo.rgb[i], logo.alpha[i])
+# chevron and stem
+ink = hex_rgb(logo.INK_ON_DARK)
+blend(stroke_cov(polyline_dist(logo.chevron), logo.W), ink)
+blend(stroke_cov(polyline_dist(logo.stem), logo.W), ink)
 
-# arc ticks with gradient along the arc
-stops = np.array([[0x6C, 0x5C, 0xE7], [0x00, 0xB8, 0xD9], [0xF5, 0xA6, 0x23]], float)
-for j in range(logo.ticks):
-    t = j / (logo.ticks - 1)
-    seg = min(int(t * 2), 1); f = t * 2 - seg
-    col = stops[seg] * (1 - f) + stops[seg + 1] * f if logo.done[j] else np.array([0x30, 0x36, 0x3D], float)
-    blend(segment(logo.ax0[j], logo.ay0[j], logo.ax1[j], logo.ay1[j], 7.5 if logo.done[j] else 5.0), col, 1.0)
-
-# chevron bars (rounded by dilating with the stroke width) and the pivot ring
-fg = (0xE6, 0xED, 0xF3)
-for P in (logo.chev_a, logo.chev_b):
-    core = polygon(P)
-    # approximate round join: union of the polygon and discs along its edges
-    m = core.copy()
-    for k in range(len(P)):
-        (x0, y0), (x1, y1) = P[k], P[(k + 1) % len(P)]
-        m = np.maximum(m, segment(x0, y0, x1, y1, 22.0))
-    blend(m, fg, 1.0)
-ring = disc(logo.cx, logo.cy - 52, 26 + 7) - disc(logo.cx, logo.cy - 52, 26 - 7)
-blend(disc(logo.cx, logo.cy - 52, 26 - 7), (0x0B, 0x0F, 0x19), 1.0)
-blend(np.clip(ring, 0, 1), fg, 1.0)
-
-out = np.clip(img, 0, 255).astype(np.uint8)
+out = np.zeros((S, S, 4), np.uint8)
+out[..., :3] = np.clip(img[..., :3], 0, 255).astype(np.uint8)
 out[..., 3] = (np.clip(img[..., 3], 0, 1) * 255).astype(np.uint8)
 im = Image.fromarray(out, "RGBA")
 im.save(here / "logo.png")

@@ -11,19 +11,18 @@
     in-place AddPackage fails with 0x80073CFF, and the user is told to wipe
     the app and reinstall from scratch after every release.
 
-    This tool performs the full repair in two phases:
+    The repair runs in two phases:
 
       user phase      resolve the latest release for the machine architecture,
                       download the MSIX with BITS (resumable, live progress),
                       verify the Authenticode signature, hand off to the
                       elevated phase (one UAC prompt).
       elevated phase  stop only real Claude Desktop processes (Claude Code CLI
-                      is never touched), remove the stale CoworkVMService by
-                      taking ownership of its registry key, fix sideloading
-                      policy (including Group Policy / MDM overrides that
-                      silently block AppX deployment), remove stale package
-                      registrations, install the package with a live progress
-                      bar, verify, and launch.
+                      is never touched), delete the stale CoworkVMService
+                      through the SCM as SYSTEM, fix sideloading policy
+                      (including Group Policy / MDM overrides), remove stale
+                      package registrations, install the package with a live
+                      progress bar, verify, and launch.
 
     User data (sessions, settings) is preserved unless -PurgeUserData is given.
 
@@ -61,7 +60,7 @@ $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$Script:Version   = '3.0.0'
+$Script:Version   = '3.1.0'
 $Script:UserAgent = "claude-desktop-updater/$Script:Version"
 
 $ExitOk            = 0
@@ -79,11 +78,18 @@ if (-not (Test-Path $Script:WorkDir)) { New-Item -ItemType Directory -Path $Scri
 # The elevated child writes to its own file; two processes appending to one
 # file caused lock collisions and silently dropped lines.
 $Script:LogPath     = Join-Path $Script:WorkDir $(if ($ElevatedPhase) { 'updater.elevated.log' } else { 'updater.log' })
+# The elevated log is owned by the elevated process; the user phase can read
+# and merge it but cannot delete it, so the elevated phase starts it fresh.
+if ($ElevatedPhase) { Remove-Item $Script:LogPath -Force -ErrorAction SilentlyContinue }
 # Fixed hand-off location so no path has to survive command-line quoting.
 $Script:PendingMsix = Join-Path $Script:WorkDir 'pending.msix'
+$Script:RunStart    = Get-Date
 
 # ==========================================================================
-# Console layer: VT enable, 24-bit colour, box drawing, progress, spinner
+# Console layer
+#   one accent colour, a step list that is rewritten in place when a step
+#   finishes, a single live progress line, no timestamps on screen (they are
+#   in the log file).
 # ==========================================================================
 $Script:VT = $false
 if (-not $NoColor) {
@@ -107,127 +113,127 @@ $E = [char]27
 function Esc([string]$code) { if ($Script:VT) { "$E[$code" } else { '' } }
 function Rgb([int]$r, [int]$g, [int]$b) { Esc "38;2;$r;$g;${b}m" }
 $Script:C = @{
-    Reset = Esc '0m'; Bold = Esc '1m'; Dim = Esc '2m'
-    Red = Rgb 255 95 95; Green = Rgb 80 220 120; Yellow = Rgb 255 200 70
-    Cyan = Rgb 60 200 235; Blue = Rgb 110 130 255; Grey = Rgb 130 140 150
-    White = Rgb 235 240 245; Violet = Rgb 150 110 255; Amber = Rgb 245 166 35
+    Reset  = Esc '0m'; Bold = Esc '1m'
+    Accent = Rgb 217 119 87        # terracotta
+    Ok     = Rgb 63 185 80
+    Warn   = Rgb 210 153 34
+    Err    = Rgb 248 81 73
+    Dim    = Rgb 139 148 158
 }
 $Script:G = if ($Script:Unicode) {
-    @{ Full = [string][char]0x2588; Empty = [string][char]0x2591; Ok = [string][char]0x2714
-       Fail = [string][char]0x2716; Warn = [string][char]0x25B2; Arrow = [string][char]0x276F
-       TL = [char]0x256D; TR = [char]0x256E; BL = [char]0x2570; BR = [char]0x256F; H = [char]0x2500; V = [char]0x2502 }
+    @{ Active = [string][char]0x25CF; Done = [string][char]0x2713; Warn = '!'; Fail = [string][char]0x2717
+       BarFull = [string][char]0x2501; BarHead = [string][char]0x2578; BarEmpty = [string][char]0x2500; Dot = [string][char]0x00B7 }
 } else {
-    @{ Full = '#'; Empty = '-'; Ok = 'OK'; Fail = '!!'; Warn = '!'; Arrow = '>'
-       TL = '+'; TR = '+'; BL = '+'; BR = '+'; H = '-'; V = '|' }
+    @{ Active = '*'; Done = '+'; Warn = '!'; Fail = 'x'; BarFull = '='; BarHead = '>'; BarEmpty = '-'; Dot = '.' }
 }
 $Script:Spinner = if ($Script:Unicode) {
     @(0x280B,0x2819,0x2839,0x2838,0x283C,0x2834,0x2826,0x2827,0x2807,0x280F) | ForEach-Object { [string][char]$_ }
 } else { @('|','/','-','\') }
 $Script:SpinIdx  = 0
-$Script:LineOpen = $false
-$Script:Step     = 0
-$Script:Steps    = 7
+$Script:LiveOpen = $false
+$Script:Step     = $null
 
-function Get-Width { try { $w = [Console]::WindowWidth; if ($w -gt 40) { return $w } } catch {}; 100 }
+function Get-Width { try { $w = [Console]::WindowWidth; if ($w -gt 40) { return [Math]::Min($w, 110) } } catch {}; 100 }
 function Strip([string]$s) { $s -replace "$E\[[0-9;]*m", '' }
+function Fit([string]$s, [int]$max) { if ($s.Length -le $max) { $s } else { $s.Substring(0, [Math]::Max(0, $max - 1)) + [string][char]0x2026 } }
 
-function Close-Line {
-    if ($Script:LineOpen) { Write-Host ("`r" + (' ' * ((Get-Width) - 1)) + "`r") -NoNewline; $Script:LineOpen = $false }
+function Close-Live {
+    if ($Script:LiveOpen) { Write-Host ("`r" + (' ' * ((Get-Width) - 1)) + "`r") -NoNewline; $Script:LiveOpen = $false }
 }
-
-# Gradient text: interpolates between two RGB triplets across the string.
-function Gradient([string]$text, [int[]]$from, [int[]]$to) {
-    if (-not $Script:VT) { return $text }
-    $n = [Math]::Max(1, $text.Length - 1); $sb = New-Object System.Text.StringBuilder
-    for ($i = 0; $i -lt $text.Length; $i++) {
-        $t = $i / $n
-        $r = [int]($from[0] + ($to[0] - $from[0]) * $t)
-        $g = [int]($from[1] + ($to[1] - $from[1]) * $t)
-        $b = [int]($from[2] + ($to[2] - $from[2]) * $t)
-        [void]$sb.Append((Rgb $r $g $b)).Append($text[$i])
-    }
-    [void]$sb.Append($Script:C.Reset); $sb.ToString()
+function Write-Line([string]$s) {
+    Close-Live
+    Write-Host $s
+    if ($Script:Step) { $Script:Step.Lines++ }
 }
-
-function Write-Log {
-    param([string]$Message, [ValidateSet('INFO','WARN','ERROR','OK','STEP','DETAIL')][string]$Level = 'INFO', [switch]$NoConsole)
-    $line = "{0}  [{1,-5}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Level, $Message
-    for ($i = 0; $i -lt 5; $i++) {
-        try { [System.IO.File]::AppendAllText($Script:LogPath, $line + [Environment]::NewLine); break } catch { Start-Sleep -Milliseconds 40 }
-    }
-    if ($NoConsole) { return }
-    Close-Line
-    $c = $Script:C; $g = $Script:G
-    $clock = "$($c.Grey)$(Get-Date -Format 'HH:mm:ss')$($c.Reset)"
-    switch ($Level) {
-        'STEP'   { $Script:Step++
-                   $tag = "$($c.Violet)[$($Script:Step)/$($Script:Steps)]$($c.Reset)"
-                   Write-Host ""; Write-Host "  $clock $tag $($c.Bold)$($c.White)$Message$($c.Reset)" }
-        'OK'     { Write-Host "  $clock   $($c.Green)$($g.Ok)$($c.Reset)  $Message" }
-        'WARN'   { Write-Host "  $clock   $($c.Yellow)$($g.Warn)$($c.Reset)  $($c.Yellow)$Message$($c.Reset)" }
-        'ERROR'  { Write-Host "  $clock   $($c.Red)$($g.Fail)$($c.Reset)  $($c.Red)$Message$($c.Reset)" }
-        'DETAIL' { Write-Host "  $clock      $($c.Grey)$Message$($c.Reset)" }
-        default  { Write-Host "  $clock   $($c.Grey)$($g.Arrow)$($c.Reset)  $Message" }
-    }
+function Format-Elapsed([double]$s) {
+    if ($s -lt 1) { return ('{0:N0}ms' -f ($s * 1000)) }
+    if ($s -lt 60) { return ('{0:N1}s' -f $s) }
+    $ts = [TimeSpan]::FromSeconds([Math]::Round($s))
+    if ($ts.TotalHours -ge 1) { return ('{0}h {1:00}m' -f [int]$ts.TotalHours, $ts.Minutes) }
+    '{0}m {1:00}s' -f $ts.Minutes, $ts.Seconds
 }
-
-function Write-Banner {
-    $c = $Script:C; $g = $Script:G
-    $title = "CLAUDE DESKTOP UPDATER"
-    $sub   = "MSIX repair and update tool for Windows"
-    $meta  = "v$Script:Version   github.com/adzetto/claude-desktop-updater"
-    $inner = [Math]::Max($title.Length, [Math]::Max($sub.Length, $meta.Length)) + 6
-    $inner = [Math]::Min($inner, (Get-Width) - 4)
-    $bar   = [string]$g.H * $inner
-    $pad = { param($s) $s + (' ' * [Math]::Max(0, $inner - (Strip $s).Length)) }
-    Write-Host ""
-    Write-Host "  $($c.Violet)$($g.TL)$bar$($g.TR)$($c.Reset)"
-    Write-Host "  $($c.Violet)$($g.V)$($c.Reset)$(& $pad ("   " + (Gradient $title @(150,110,255) @(245,166,35))))$($c.Violet)$($g.V)$($c.Reset)"
-    Write-Host "  $($c.Violet)$($g.V)$($c.Reset)$(& $pad ("   $($c.White)$sub$($c.Reset)"))$($c.Violet)$($g.V)$($c.Reset)"
-    Write-Host "  $($c.Violet)$($g.V)$($c.Reset)$(& $pad ("   $($c.Grey)$meta$($c.Reset)"))$($c.Violet)$($g.V)$($c.Reset)"
-    Write-Host "  $($c.Violet)$($g.BL)$bar$($g.BR)$($c.Reset)"
-}
-
 function Format-Bytes([double]$b) {
     if ($b -ge 1GB) { '{0:N2} GB' -f ($b / 1GB) } elseif ($b -ge 1MB) { '{0:N1} MB' -f ($b / 1MB) }
     elseif ($b -ge 1KB) { '{0:N0} KB' -f ($b / 1KB) } else { "$([int]$b) B" }
 }
-function Format-Duration([double]$s) {
+function Format-Clock([double]$s) {
     if ($s -lt 0 -or [double]::IsInfinity($s) -or [double]::IsNaN($s)) { return '--:--' }
     $ts = [TimeSpan]::FromSeconds([Math]::Round($s))
     if ($ts.TotalHours -ge 1) { '{0:00}:{1:00}:{2:00}' -f [int]$ts.TotalHours, $ts.Minutes, $ts.Seconds } else { '{0:00}:{1:00}' -f $ts.Minutes, $ts.Seconds }
 }
 
-# Single-line progress bar redrawn in place. Percent -1 => indeterminate wave.
+# A step line is printed when the step starts and rewritten in place when it
+# ends (glyph reflects the worst level logged meanwhile, duration on the right).
+function Start-Step([string]$text) {
+    Complete-Step
+    Write-Line "  $($Script:C.Accent)$($Script:G.Active)$($Script:C.Reset) $text"
+    $Script:Step = @{ Text = $text; Start = Get-Date; Lines = 0; State = 'ok' }
+}
+function Complete-Step {
+    if (-not $Script:Step) { return }
+    $s = $Script:Step; $Script:Step = $null
+    $c = $Script:C; $g = $Script:G
+    $dur = Format-Elapsed ((Get-Date) - $s.Start).TotalSeconds
+    $glyph = switch ($s.State) { 'warn' { "$($c.Warn)$($g.Warn)" } 'fail' { "$($c.Err)$($g.Fail)" } default { "$($c.Ok)$($g.Done)" } }
+    $left = "  $glyph$($c.Reset) $($s.Text)"
+    $pad  = [Math]::Max(1, (Get-Width) - 2 - (Strip $left).Length - $dur.Length)
+    $line = $left + (' ' * $pad) + "$($c.Dim)$dur$($c.Reset)"
+    if ($Script:VT) {
+        Close-Live
+        $up = $s.Lines + 1
+        Write-Host ("$E[${up}A`r$line$E[K$E[${up}B`r") -NoNewline
+    } else {
+        Write-Host "    done in $dur"
+    }
+}
+function Write-Log {
+    param([string]$Message, [ValidateSet('INFO','WARN','ERROR','OK','STEP','DETAIL')][string]$Level = 'INFO', [switch]$NoConsole)
+    $line = "{0}  [{1,-6}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Level, $Message
+    for ($i = 0; $i -lt 5; $i++) {
+        try { [System.IO.File]::AppendAllText($Script:LogPath, $line + [Environment]::NewLine); break } catch { Start-Sleep -Milliseconds 40 }
+    }
+    if ($NoConsole) { return }
+    $c = $Script:C; $g = $Script:G
+    $max = (Get-Width) - 9
+    switch ($Level) {
+        'STEP'   { Start-Step $Message }
+        'OK'     { Write-Line "      $(Fit $Message $max)" }
+        'WARN'   { if ($Script:Step -and $Script:Step.State -ne 'fail') { $Script:Step.State = 'warn' }
+                   Write-Line "      $($c.Warn)$($g.Warn) $(Fit $Message ($max - 2))$($c.Reset)" }
+        'ERROR'  { if ($Script:Step) { $Script:Step.State = 'fail' }
+                   Write-Line "      $($c.Err)$($g.Fail) $(Fit $Message ($max - 2))$($c.Reset)" }
+        default  { Write-Line "      $($c.Dim)$(Fit $Message $max)$($c.Reset)" }
+    }
+}
+function Write-Header {
+    $c = $Script:C
+    $tag = if ($ElevatedPhase) { "v$Script:Version $($Script:G.Dot) elevated" } else { "v$Script:Version" }
+    Write-Host ""
+    Write-Host "  $($c.Bold)claude-desktop-updater$($c.Reset) $($c.Dim)$tag$($c.Reset)"
+    Write-Host ""
+}
+# Live line at the bottom: spinner, thin bar, percent and detail. Percent -1
+# draws an indeterminate bar.
 function Show-Progress([string]$Label, [double]$Percent, [string]$Detail = '') {
     $c = $Script:C; $g = $Script:G
-    $width = [Math]::Max(14, [Math]::Min(36, (Get-Width) - 58))
+    $width = [Math]::Max(16, [Math]::Min(40, (Get-Width) - 62))
     if ($Percent -lt 0) {
         $pos = $Script:SpinIdx % ($width * 2); if ($pos -ge $width) { $pos = 2 * $width - $pos - 1 }
         $bar = ''
-        for ($i = 0; $i -lt $width; $i++) { $bar += if ([Math]::Abs($i - $pos) -le 2) { $g.Full } else { $g.Empty } }
-        $barStr = "$($c.Cyan)$bar$($c.Reset)"; $pct = '      '
+        for ($i = 0; $i -lt $width; $i++) { $bar += if ([Math]::Abs($i - $pos) -le 3) { "$($c.Accent)$($g.BarFull)" } else { "$($c.Dim)$($g.BarEmpty)" } }
+        $bar += $c.Reset; $pct = '      '
     } else {
         $Percent = [Math]::Max(0, [Math]::Min(100, $Percent))
-        $filled  = [int][Math]::Round($width * $Percent / 100)
-        $fillStr = ''
-        for ($i = 0; $i -lt $filled; $i++) {
-            $t = if ($width -gt 1) { $i / ($width - 1) } else { 0 }
-            $fillStr += (Rgb ([int](150 + 95 * $t)) ([int](110 + 56 * $t)) ([int](255 - 220 * $t))) + $g.Full
-        }
-        $barStr = "$fillStr$($c.Grey)$($g.Empty * ($width - $filled))$($c.Reset)"
+        $filled = [int][Math]::Floor($width * $Percent / 100)
+        $head = if ($filled -gt 0 -and $filled -lt $width) { $g.BarHead } else { '' }
+        $bar = "$($c.Accent)$($g.BarFull * $filled)$head$($c.Dim)$($g.BarEmpty * ($width - $filled - $head.Length))$($c.Reset)"
         $pct = '{0,5:N1}%' -f $Percent
     }
     $spin = $Script:Spinner[$Script:SpinIdx % $Script:Spinner.Count]; $Script:SpinIdx++
-    $line = "  $($c.Cyan)$spin$($c.Reset) $($c.Bold)$($Label.PadRight(12))$($c.Reset) $barStr $($c.White)$pct$($c.Reset)  $($c.Grey)$Detail$($c.Reset)"
+    $line = "      $($c.Accent)$spin$($c.Reset) $bar $pct  $($c.Dim)$Detail$($c.Reset)"
     $pad  = [Math]::Max(0, (Get-Width) - 1 - (Strip $line).Length)
     Write-Host ("`r" + $line + (' ' * $pad)) -NoNewline
-    $Script:LineOpen = $true
-}
-function Complete-Progress([string]$Label, [string]$Detail, [switch]$Failed) {
-    Close-Line; $c = $Script:C; $g = $Script:G
-    if ($Failed) { Write-Host "  $($c.Red)$($g.Fail)$($c.Reset) $($c.Bold)$($Label.PadRight(12))$($c.Reset) $($c.Red)$Detail$($c.Reset)" }
-    else         { Write-Host "  $($c.Green)$($g.Ok)$($c.Reset) $($c.Bold)$($Label.PadRight(12))$($c.Reset) $($c.Grey)$Detail$($c.Reset)" }
+    $Script:LiveOpen = $true
 }
 
 function Test-IsElevated {
@@ -240,17 +246,14 @@ function Get-SelfPath {
     @{ Path = $ps1; IsExe = $false }
 }
 
-if ($ElevatedPhase) {
-    $c = $Script:C
-    Write-Host ""; Write-Host "  $($c.Violet)$($c.Bold)ELEVATED PHASE$($c.Reset) $($c.Grey)cleanup and installation$($c.Reset)"
-} else { Write-Banner }
+Write-Header
 Write-Log "=== claude-desktop-updater v$Script:Version started (elevated=$(Test-IsElevated), phase=$(if ($ElevatedPhase) {'elevated'} else {'user'}), args: $($PSBoundParameters.Keys -join ' ')) ===" -NoConsole
 
 # ==========================================================================
 # Step: stop Claude Desktop processes (never the Claude Code CLI)
 # ==========================================================================
 function Stop-ClaudeDesktopProcesses {
-    Write-Log "Stopping Claude Desktop processes" 'STEP'
+    Write-Log "Stopping Claude Desktop" 'STEP'
     $patterns = @('\\WindowsApps\\Claude', '\\AnthropicClaude\\', '\\Claude\\Claude\.exe')
     $killed = 0; $kept = 0
     Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^(Claude|Claude Setup|CoworkVM.*)$' } | ForEach-Object {
@@ -259,26 +262,26 @@ function Stop-ClaudeDesktopProcesses {
         if ($path) { foreach ($pat in $patterns) { if ($path -match $pat) { $isDesktop = $true; break } } }
         elseif ($p.ProcessName -like 'Claude Setup*' -or $p.ProcessName -like 'CoworkVM*') { $isDesktop = $true }
         if ($isDesktop) {
-            Write-Log "Stopping $($p.ProcessName) (PID $($p.Id))" 'DETAIL'
+            Write-Log "stopped $($p.ProcessName) (PID $($p.Id))" 'DETAIL'
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; $killed++
         } elseif ($path) { $kept++ }
     }
-    if ($kept -gt 0) { Write-Log "$kept other 'claude' process(es) left untouched (Claude Code CLI)" 'DETAIL' }
-    Write-Log "$killed Claude Desktop process(es) stopped" 'OK'
+    if ($kept -gt 0) { Write-Log "$kept Claude Code CLI process(es) left untouched" 'DETAIL' }
+    Write-Log "$killed process(es) stopped" 'OK'
     if ($killed -gt 0) { Start-Sleep -Seconds 2 }
 }
 
 # ==========================================================================
 # Step: remove the stale CoworkVMService
-# ==========================================================================
 # Returns 'absent', 'removed', 'present' (could not touch it) or 'pending'
 # (only a reboot completes the removal; package registration would fail
 # with 0x80073CF6 until then).
+# ==========================================================================
 function Remove-CoworkService {
-    Write-Log "Checking for a stale CoworkVMService" 'STEP'
+    Write-Log "Removing stale CoworkVMService" 'STEP'
     $name = 'CoworkVMService'
-    if (-not (Get-Service -Name $name -ErrorAction SilentlyContinue)) { Write-Log "Service not present" 'OK'; return 'absent' }
-    if (-not (Test-IsElevated)) { Write-Log "Administrator rights required to remove the service, skipping" 'WARN'; return 'present' }
+    if (-not (Get-Service -Name $name -ErrorAction SilentlyContinue)) { Write-Log "no stale service registered" 'OK'; return 'absent' }
+    if (-not (Test-IsElevated)) { Write-Log "administrator rights required, skipped" 'WARN'; return 'present' }
 
     & sc.exe stop $name 2>&1 | Out-Null
     $key    = "HKLM:\SYSTEM\CurrentControlSet\Services\$name"
@@ -288,21 +291,21 @@ function Remove-CoworkService {
         # the service. The SCM persists both the descriptor change and the
         # delete flag in this key, so every attempt fails with error 2 until
         # the key exists again. Recreate the skeleton, then delete properly.
-        Write-Log "Service is known to the SCM but its registry key is missing; recreating the key skeleton" 'WARN'
+        Write-Log "registry key missing while the SCM still holds the service, recreating the key skeleton" 'WARN'
         try {
             New-Item -Path $key -Force | Out-Null
             New-Item -Path (Join-Path $key 'Security') -Force | Out-Null
             $hasKey = $true
-        } catch { Write-Log "Could not recreate the key: $($_.Exception.Message)" 'WARN' }
+        } catch { Write-Log "could not recreate the key: $($_.Exception.Message)" 'WARN' }
     }
 
     # 1) plain deletion as administrator (works when the descriptor allows it)
     $o = & sc.exe delete $name 2>&1; Write-Log "sc delete as administrator: $o" 'DETAIL'
-    if (-not (Get-Service -Name $name -ErrorAction SilentlyContinue)) { Write-Log "CoworkVMService removed" 'OK'; return 'removed' }
+    if (-not (Get-Service -Name $name -ErrorAction SilentlyContinue)) { Write-Log "service removed" 'OK'; return 'removed' }
 
     # 2) The packaged service's security descriptor denies administrators
-    #    (OpenService fails with 5), but grants SYSTEM. Repeat the deletion as
-    #    SYSTEM through a one-shot scheduled task; this does not need a reboot.
+    #    (OpenService fails with 5) but its owner is SYSTEM. Repeat the
+    #    deletion as SYSTEM through a one-shot scheduled task; no reboot needed.
     $task = 'claude-desktop-updater-svc'
     $cmd  = Join-Path $Script:WorkDir 'svc-delete.cmd'
     $out  = Join-Path $Script:WorkDir 'svc-delete.out'
@@ -322,7 +325,7 @@ function Remove-CoworkService {
         & schtasks.exe /Delete /F /TN $task 2>&1 | Out-Null
         Remove-Item $cmd, $out -Force -ErrorAction SilentlyContinue
     }
-    if (-not (Get-Service -Name $name -ErrorAction SilentlyContinue)) { Write-Log "CoworkVMService removed (SYSTEM context)" 'OK'; return 'removed' }
+    if (-not (Get-Service -Name $name -ErrorAction SilentlyContinue)) { Write-Log "service removed in SYSTEM context" 'OK'; return 'removed' }
 
     # 3) Last resort: take ownership of the registry key and drop it. The SCM
     #    keeps its in-memory entry until the next boot, so report 'pending'.
@@ -339,10 +342,10 @@ function Remove-CoworkService {
                 [Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
             Set-Acl -Path $key -AclObject $acl2 -ErrorAction SilentlyContinue
             Remove-Item -Path $key -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Log "Deleted the service registry key" 'DETAIL'
-        } catch { Write-Log "Registry key removal failed: $($_.Exception.Message)" 'WARN' }
+            Write-Log "deleted the service registry key" 'DETAIL'
+        } catch { Write-Log "registry key removal failed: $($_.Exception.Message)" 'WARN' }
     }
-    Write-Log "Service removal is pending a reboot; the package cannot register its service until then" 'WARN'
+    Write-Log "removal is pending a reboot; the package cannot register its service until then" 'WARN'
     'pending'
 }
 
@@ -351,14 +354,14 @@ function Remove-CoworkService {
 # ==========================================================================
 function Enable-SideloadingPolicy {
     Write-Log "Verifying sideloading policy" 'STEP'
-    if (-not (Test-IsElevated)) { Write-Log "Administrator rights required, skipping" 'WARN'; return $true }
+    if (-not (Test-IsElevated)) { Write-Log "administrator rights required, skipped" 'WARN'; return $true }
     $unlock = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
     try {
         if (-not (Test-Path $unlock)) { New-Item -Path $unlock -Force | Out-Null }
         New-ItemProperty -Path $unlock -Name 'AllowDevelopmentWithoutDevLicense' -PropertyType DWord -Value 1 -Force | Out-Null
         New-ItemProperty -Path $unlock -Name 'AllowAllTrustedApps' -PropertyType DWord -Value 1 -Force | Out-Null
         Write-Log "AppModelUnlock keys set" 'DETAIL'
-    } catch { Write-Log "Could not write AppModelUnlock: $($_.Exception.Message)" 'WARN' }
+    } catch { Write-Log "could not write AppModelUnlock: $($_.Exception.Message)" 'WARN' }
 
     # Policy keys under Policies\Microsoft\Windows\Appx take precedence over
     # AppModelUnlock. A managed device (MdmHosts present) typically has
@@ -366,22 +369,22 @@ function Enable-SideloadingPolicy {
     # "you need a developer license or a sideloading-enabled system" even
     # when Developer Mode looks enabled in Settings.
     $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx'
-    if (-not (Test-Path $policy)) { Write-Log "No policy override present" 'OK'; return $true }
+    if (-not (Test-Path $policy)) { Write-Log "no policy override present" 'OK'; return $true }
     $pol = Get-ItemProperty -Path $policy -ErrorAction SilentlyContinue
     if (-not $pol -or ($pol.AllowAllTrustedApps -ne 0 -and $pol.AllowDevelopmentWithoutDevLicense -ne 0)) {
-        Write-Log "Policy keys allow sideloading" 'OK'; return $true
+        Write-Log "policy keys allow sideloading" 'OK'; return $true
     }
-    Write-Log "Group Policy / MDM is blocking sideloading (Policies\Appx AllowAllTrustedApps=0)" 'WARN'
+    Write-Log "Group Policy / MDM blocks sideloading (Policies\Appx AllowAllTrustedApps=0)" 'WARN'
     try {
         Set-ItemProperty -Path $policy -Name 'AllowAllTrustedApps' -Value 1 -Type DWord -Force -ErrorAction Stop
         Set-ItemProperty -Path $policy -Name 'AllowDevelopmentWithoutDevLicense' -Value 1 -Type DWord -Force -ErrorAction Stop
-        Write-Log "Policy keys set to allow sideloading" 'OK'
+        Write-Log "policy keys set to allow sideloading" 'OK'
         try { Restart-Service -Name AppXSvc -Force -ErrorAction Stop; Write-Log "AppX Deployment Service restarted" 'DETAIL' }
         catch { Write-Log "AppXSvc restart failed: $($_.Exception.Message)" 'WARN' }
-        if ($pol.MdmHosts) { Write-Log "This device is MDM managed; a policy sync may revert this setting later" 'WARN' }
+        if ($pol.MdmHosts) { Write-Log "this device is MDM managed; a policy sync may revert this setting later" 'WARN' }
         $true
     } catch {
-        Write-Log "Could not change the policy keys: $($_.Exception.Message)" 'ERROR'; $false
+        Write-Log "could not change the policy keys: $($_.Exception.Message)" 'ERROR'; $false
     }
 }
 
@@ -389,25 +392,24 @@ function Enable-SideloadingPolicy {
 # Step: remove stale package registrations
 # ==========================================================================
 function Remove-ClaudePackages {
-    Write-Log "Removing existing Claude package registrations" 'STEP'
+    Write-Log "Removing existing package registration" 'STEP'
     $found = @(Get-AppxPackage -Name '*Claude*' -ErrorAction SilentlyContinue)
     if (Test-IsElevated) { $found += @(Get-AppxPackage -AllUsers -Name '*Claude*' -ErrorAction SilentlyContinue) }
     $found = @($found | Sort-Object PackageFullName -Unique)
-    if ($found.Count -eq 0) { Write-Log "No package installed" 'OK'; return }
+    if ($found.Count -eq 0) { Write-Log "no package registered" 'OK'; return }
     foreach ($p in $found) {
-        Write-Log "Removing $($p.PackageFullName)" 'DETAIL'
         $done = $false
-        try { Remove-AppxPackage -Package $p.PackageFullName -ErrorAction Stop; $done = $true; Write-Log "Removed (current user)" 'OK' }
-        catch { Write-Log "User-scope removal failed: $($_.Exception.Message)" 'WARN' }
+        try { Remove-AppxPackage -Package $p.PackageFullName -ErrorAction Stop; $done = $true; Write-Log "removed $($p.PackageFullName)" 'OK' }
+        catch { Write-Log "user-scope removal failed: $($_.Exception.Message)" 'WARN' }
         if (-not $done -and (Test-IsElevated)) {
-            try { Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction Stop; Write-Log "Removed (all users)" 'OK' }
-            catch { Write-Log "All-users removal failed: $($_.Exception.Message)" 'ERROR' }
+            try { Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction Stop; Write-Log "removed $($p.PackageFullName) for all users" 'OK' }
+            catch { Write-Log "all-users removal failed: $($_.Exception.Message)" 'ERROR' }
         }
     }
     if (Test-IsElevated) {
         try {
             Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object { $_.PackageName -like '*Claude*' } | ForEach-Object {
-                Write-Log "Removing provisioned package $($_.PackageName)" 'DETAIL'
+                Write-Log "removed provisioned package $($_.PackageName)" 'DETAIL'
                 Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction SilentlyContinue | Out-Null
             }
         } catch {}
@@ -418,7 +420,7 @@ function Remove-ClaudePackages {
 # Step: leftovers and winget registration
 # ==========================================================================
 function Clear-Leftovers([bool]$Purge, [string]$Keep) {
-    Write-Log "Cleaning leftovers (user data: $(if ($Purge) {'purged'} else {'preserved'}))" 'STEP'
+    Write-Log "Cleaning leftovers" 'STEP'
     $paths = @((Join-Path $env:LOCALAPPDATA 'AnthropicClaude'), (Join-Path $env:LOCALAPPDATA 'SquirrelTemp'))
     Get-ChildItem -Path $env:TEMP -Filter 'Claude-*.msix' -ErrorAction SilentlyContinue |
         Where-Object { -not $Keep -or $_.FullName -ne $Keep } | ForEach-Object { $paths += $_.FullName }
@@ -430,7 +432,7 @@ function Clear-Leftovers([bool]$Purge, [string]$Keep) {
     foreach ($p in ($paths | Sort-Object -Unique)) {
         if ($p -and (Test-Path $p)) {
             Remove-Item -Path $p -Recurse -Force -ErrorAction SilentlyContinue
-            if (Test-Path $p) { Write-Log "Could not delete $p (in use)" 'WARN' } else { Write-Log "Deleted $p" 'DETAIL'; $n++ }
+            if (Test-Path $p) { Write-Log "could not delete $p (in use)" 'WARN' } else { Write-Log "deleted $p" 'DETAIL'; $n++ }
         }
     }
     if (Get-Command winget -ErrorAction SilentlyContinue) {
@@ -438,11 +440,11 @@ function Clear-Leftovers([bool]$Purge, [string]$Keep) {
             $list = & winget list --id Anthropic.Claude --accept-source-agreements 2>$null | Out-String
             if ($list -match 'Anthropic\.Claude') {
                 & winget uninstall --id Anthropic.Claude --silent --accept-source-agreements 2>$null | Out-Null
-                Write-Log "Removed winget registration Anthropic.Claude" 'DETAIL'; $n++
+                Write-Log "removed winget registration Anthropic.Claude" 'DETAIL'; $n++
             }
         } catch { Write-Log "winget check failed: $($_.Exception.Message)" 'WARN' }
     }
-    Write-Log "$n item(s) cleaned" 'OK'
+    Write-Log "$n item(s) cleaned, user data $(if ($Purge) {'purged'} else {'preserved'})" 'OK'
 }
 
 # ==========================================================================
@@ -461,7 +463,7 @@ function Resolve-LatestRelease {
             $resp = $req.GetResponse(); $url = $resp.Headers['Location']; if (-not $url) { $url = $resp.ResponseUri.AbsoluteUri }; $resp.Close()
         } catch {
             try { $url = $_.Exception.Response.Headers['Location'] } catch {}
-            if (-not $url) { Write-Log "Resolve attempt $i failed: $($_.Exception.Message)" 'WARN'; Start-Sleep -Seconds (2 * $i) }
+            if (-not $url) { Write-Log "resolve attempt $i failed: $($_.Exception.Message)" 'WARN'; Start-Sleep -Seconds (2 * $i) }
         }
     }
     if (-not $url) { return $null }
@@ -472,17 +474,18 @@ function Resolve-LatestRelease {
 function Test-Signature([string]$Path) {
     try {
         $sig = Get-AuthenticodeSignature -FilePath $Path -ErrorAction Stop
-        if ($sig.Status -ne 'Valid') { Write-Log "Signature invalid (Status=$($sig.Status))" 'ERROR'; return $false }
-        if ($sig.SignerCertificate.Subject -notmatch 'Anthropic') { Write-Log "Unexpected signer: $($sig.SignerCertificate.Subject)" 'ERROR'; return $false }
-        Write-Log "Authenticode signature valid: $(($sig.SignerCertificate.Subject -split ',')[0])" 'OK'; $true
-    } catch { Write-Log "Signature check failed: $($_.Exception.Message)" 'ERROR'; $false }
+        if ($sig.Status -ne 'Valid') { Write-Log "signature invalid (Status=$($sig.Status))" 'ERROR'; return $false }
+        if ($sig.SignerCertificate.Subject -notmatch 'Anthropic') { Write-Log "unexpected signer: $($sig.SignerCertificate.Subject)" 'ERROR'; return $false }
+        $cn = if ($sig.SignerCertificate.Subject -match 'CN="?([^"]+?)"?(,|$)') { $Matches[1] } else { $sig.SignerCertificate.Subject }
+        Write-Log "Authenticode signature valid, signer $cn" 'OK'; $true
+    } catch { Write-Log "signature check failed: $($_.Exception.Message)" 'ERROR'; $false }
 }
 
 function Get-Package([string]$Url, [string]$Destination) {
     if ((Test-Path $Destination) -and (Get-Item $Destination).Length -gt 100MB) {
         try {
             $sig = Get-AuthenticodeSignature -FilePath $Destination -ErrorAction Stop
-            if ($sig.Status -eq 'Valid' -and $sig.SignerCertificate.Subject -match 'Anthropic') { Write-Log "Valid package already present, skipping download" 'OK'; return $true }
+            if ($sig.Status -eq 'Valid' -and $sig.SignerCertificate.Subject -match 'Anthropic') { Write-Log "valid package already present, download skipped" 'OK'; return $true }
         } catch {}
         Remove-Item $Destination -Force -ErrorAction SilentlyContinue
     }
@@ -507,25 +510,24 @@ function Get-Package([string]$Url, [string]$Destination) {
                 'Transferred' {
                     Complete-BitsTransfer -BitsJob $j -ErrorAction Stop; $job = $null
                     $len = (Get-Item $Destination).Length
-                    Complete-Progress 'Downloading' "$(Format-Bytes $len) in $(Format-Duration ((Get-Date) - $t0).TotalSeconds)"
-                    Write-Log "Download complete: $len bytes" -NoConsole; return $true
+                    Write-Log "$(Format-Bytes $len) in $(Format-Clock ((Get-Date) - $t0).TotalSeconds) via BITS" 'OK'; return $true
                 }
                 'Error'          { $e = $j.ErrorDescription; Remove-BitsTransfer -BitsJob $j -ErrorAction SilentlyContinue; $job = $null; throw "BITS error: $e" }
-                'TransientError' { Show-Progress 'Downloading' $(if ($tot -gt 0) { 100 * $b / $tot } else { -1 }) 'transient network error, retrying' }
-                'Connecting'     { Show-Progress 'Downloading' -1 'connecting' }
-                'Queued'         { Show-Progress 'Downloading' -1 'queued' }
+                'TransientError' { Show-Progress 'download' $(if ($tot -gt 0) { 100 * $b / $tot } else { -1 }) 'transient network error, retrying' }
+                'Connecting'     { Show-Progress 'download' -1 'connecting' }
+                'Queued'         { Show-Progress 'download' -1 'queued' }
                 default {
                     if ($tot -gt 0) {
                         $eta = if ($speed -gt 0) { ($tot - $b) / $speed } else { -1 }
-                        Show-Progress 'Downloading' (100 * $b / $tot) "$(Format-Bytes $b) / $(Format-Bytes $tot)   $(Format-Bytes $speed)/s   ETA $(Format-Duration $eta)"
-                    } else { Show-Progress 'Downloading' -1 "$(Format-Bytes $b) received" }
+                        Show-Progress 'download' (100 * $b / $tot) "$(Format-Bytes $b) / $(Format-Bytes $tot) $($Script:G.Dot) $(Format-Bytes $speed)/s $($Script:G.Dot) $(Format-Clock $eta) left"
+                    } else { Show-Progress 'download' -1 "$(Format-Bytes $b) received" }
                 }
             }
             if ($stall -gt 360) { throw "no progress for 3 minutes" }
         }
     } catch {
         if ($job) { Remove-BitsTransfer -BitsJob $job -ErrorAction SilentlyContinue }
-        Close-Line; Write-Log "BITS unavailable ($($_.Exception.Message)), falling back to HTTP" 'WARN'
+        Close-Live; Write-Log "BITS unavailable ($($_.Exception.Message)), falling back to HTTP" 'WARN'
     }
     # HTTP fallback with Range resume (only appended when the server answers 206)
     for ($a = 1; $a -le 4; $a++) {
@@ -542,15 +544,15 @@ function Get-Package([string]$Url, [string]$Destination) {
                 $fs.Write($buf, 0, $n); $got += $n
                 if (((Get-Date) - $lastDraw).TotalMilliseconds -ge 500) {
                     $el = ((Get-Date) - $t0).TotalSeconds; $sp = if ($el -gt 0) { ($got - $have) / $el } else { 0 }
-                    Show-Progress 'Downloading' $(if ($tot -gt 0) { 100 * $got / $tot } else { -1 }) "$(Format-Bytes $got) / $(Format-Bytes $tot)   $(Format-Bytes $sp)/s   attempt $a"
+                    Show-Progress 'download' $(if ($tot -gt 0) { 100 * $got / $tot } else { -1 }) "$(Format-Bytes $got) / $(Format-Bytes $tot) $($Script:G.Dot) $(Format-Bytes $sp)/s $($Script:G.Dot) HTTP attempt $a"
                     $lastDraw = Get-Date
                 }
             }
             $fs.Close(); $stream.Close(); $resp.Close()
             $size = (Get-Item $Destination).Length
-            if ($size -gt 100MB) { Complete-Progress 'Downloading' "$(Format-Bytes $size) (HTTP)"; return $true }
+            if ($size -gt 100MB) { Write-Log "$(Format-Bytes $size) via HTTP" 'OK'; return $true }
             throw "file too small ($size bytes)"
-        } catch { Close-Line; Write-Log "HTTP attempt $a failed: $($_.Exception.Message)" 'WARN'; if ($a -lt 4) { Start-Sleep -Seconds (5 * $a) } }
+        } catch { Close-Live; Write-Log "HTTP attempt $a failed: $($_.Exception.Message)" 'WARN'; if ($a -lt 4) { Start-Sleep -Seconds (5 * $a) } }
     }
     $false
 }
@@ -569,17 +571,17 @@ function Install-ViaWinRT([string]$Path) {
         if ($op.Status -eq $null -or "$($op.Status)" -eq '') { return $null }   # runtime not usable in this host
         while ($op.Status -eq $started) {
             $el = ((Get-Date) - $t0).TotalSeconds
-            if ($Script:Pct -gt 0) { Show-Progress 'Installing' $Script:Pct "elapsed $(Format-Duration $el)" }
-            else { Show-Progress 'Installing' -1 "registering package, elapsed $(Format-Duration $el)" }
+            if ($Script:Pct -gt 0) { Show-Progress 'install' $Script:Pct "registering package $($Script:G.Dot) $(Format-Clock $el)" }
+            else { Show-Progress 'install' -1 "registering package $($Script:G.Dot) $(Format-Clock $el)" }
             Start-Sleep -Milliseconds 200
         }
         $res = $null; try { $res = $op.GetResults() } catch {}
         if ($op.Status -eq [Windows.Foundation.AsyncStatus]::Completed -and (-not $res -or -not $res.ExtendedErrorCode -or $res.ExtendedErrorCode.HResult -eq 0)) {
-            Complete-Progress 'Installing' "done in $(Format-Duration ((Get-Date) - $t0).TotalSeconds)"; return $true
+            Close-Live; return $true
         }
         $err = if ($res -and $res.ExtendedErrorCode) { $res.ExtendedErrorCode.Message } else { "status $($op.Status)" }
-        Complete-Progress 'Installing' $err -Failed; Write-Log "WinRT deployment failed: $err" 'WARN'; $false
-    } catch { Close-Line; Write-Log "WinRT deployment path unavailable: $($_.Exception.Message)" -NoConsole; $null }
+        Close-Live; Write-Log "WinRT deployment failed: $err" 'WARN'; $false
+    } catch { Close-Live; Write-Log "WinRT deployment path unavailable: $($_.Exception.Message)" -NoConsole; $null }
 }
 
 function Install-ViaCmdlet([string]$Path, [bool]$AnyVersion) {
@@ -587,21 +589,23 @@ function Install-ViaCmdlet([string]$Path, [bool]$AnyVersion) {
         try { if ($any) { Add-AppxPackage -Path $p -ForceApplicationShutdown -ForceUpdateFromAnyVersion -ErrorAction Stop } else { Add-AppxPackage -Path $p -ForceApplicationShutdown -ErrorAction Stop }; @{ Ok = $true } }
         catch { @{ Ok = $false; Message = $_.Exception.Message } } }
     $job = Start-Job -ScriptBlock $sb -ArgumentList $Path, $AnyVersion; $t0 = Get-Date
-    while ($job.State -eq 'Running') { Show-Progress 'Installing' -1 "Add-AppxPackage, elapsed $(Format-Duration ((Get-Date) - $t0).TotalSeconds)"; Start-Sleep -Milliseconds 200 }
+    while ($job.State -eq 'Running') { Show-Progress 'install' -1 "registering package $($Script:G.Dot) $(Format-Clock ((Get-Date) - $t0).TotalSeconds)"; Start-Sleep -Milliseconds 200 }
     $r = Receive-Job -Job $job -ErrorAction SilentlyContinue; Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-    if ($r -and $r.Ok) { Complete-Progress 'Installing' "done in $(Format-Duration ((Get-Date) - $t0).TotalSeconds)"; return @{ Ok = $true } }
+    Close-Live
+    if ($r -and $r.Ok) { return @{ Ok = $true } }
     $msg = if ($r) { $r.Message } else { 'unknown error' }
-    Complete-Progress 'Installing' (($msg -split "`n")[0]) -Failed; @{ Ok = $false; Message = $msg }
+    @{ Ok = $false; Message = $msg }
 }
 
 function Install-Package([string]$Path) {
     Write-Log "Installing package" 'STEP'
     if (-not (Test-Signature $Path)) { return $false }
+    $t0 = Get-Date
     $r = Install-ViaWinRT $Path
-    if ($r -eq $true) { return $true }
+    if ($r -eq $true) { Write-Log "registered in $(Format-Elapsed ((Get-Date) - $t0).TotalSeconds)" 'OK'; return $true }
     foreach ($any in @($true, $false)) {
         $res = Install-ViaCmdlet $Path $any
-        if ($res.Ok) { return $true }
+        if ($res.Ok) { Write-Log "registered in $(Format-Elapsed ((Get-Date) - $t0).TotalSeconds)" 'OK'; return $true }
         $Script:LastInstallError = $res.Message
         Write-Log (($res.Message -split "`n")[0]) 'WARN'
         if ($res.Message -match '0x80073CFF') { Write-Log "0x80073CFF: sideloading is blocked by policy or a stale registration conflicts" 'WARN' }
@@ -618,7 +622,7 @@ function Start-ClaudeDesktop {
     try {
         $appId = @((Get-AppxPackageManifest $pkg).Package.Applications.Application)[0].Id
         Start-Process "shell:AppsFolder\$($pkg.PackageFamilyName)!$appId"; Write-Log "Claude Desktop launched" 'OK'
-    } catch { Write-Log "Launch failed: $($_.Exception.Message)" 'WARN' }
+    } catch { Write-Log "launch failed: $($_.Exception.Message)" 'WARN' }
 }
 
 function Compare-Version([string]$Installed, [string]$Latest) {
@@ -637,7 +641,8 @@ function Invoke-ElevatedPhase([string]$Msix) {
         try { Move-Item -Path $Msix -Destination $Script:PendingMsix -Force -ErrorAction Stop }
         catch { Copy-Item -Path $Msix -Destination $Script:PendingMsix -Force -ErrorAction SilentlyContinue }
     }
-    Write-Log "Requesting administrator rights (UAC)" 'STEP'
+    Write-Log "Installing with administrator rights" 'STEP'
+    Write-Log "approve the UAC prompt; the elevated phase reports in its own window" 'DETAIL'
     try {
         $p = if ($self.IsExe) { Start-Process -FilePath $self.Path -ArgumentList $args -Verb RunAs -PassThru -Wait }
              else { Start-Process -FilePath 'powershell.exe' -ArgumentList (@('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$($self.Path)`"") + $args) -Verb RunAs -PassThru -Wait }
@@ -645,112 +650,134 @@ function Invoke-ElevatedPhase([string]$Msix) {
         if (Test-Path $elev) {
             try { [System.IO.File]::AppendAllLines($Script:LogPath, [string[]](@('--- elevated phase ---') + (Get-Content $elev) + @('--- end elevated phase ---'))); Remove-Item $elev -Force } catch {}
         }
-        Write-Log "Elevated phase finished with exit code $($p.ExitCode)" -NoConsole
+        Write-Log "elevated phase finished with exit code $($p.ExitCode)" -NoConsole
+        if ($p.ExitCode -eq 0) { Write-Log "elevated phase completed" 'OK' }
         $p.ExitCode
-    } catch { Write-Log "Elevation refused or failed: $($_.Exception.Message)" 'ERROR'; $ExitNeedsAdmin }
+    } catch { Write-Log "elevation refused or failed: $($_.Exception.Message)" 'ERROR'; $ExitNeedsAdmin }
+}
+
+function Write-Outcome([bool]$Ok, [string]$Title, [string[]]$Rows) {
+    Complete-Step
+    $c = $Script:C; $g = $Script:G
+    $dur = Format-Elapsed ((Get-Date) - $Script:RunStart).TotalSeconds
+    $glyph = if ($Ok) { "$($c.Ok)$($g.Done)" } else { "$($c.Err)$($g.Fail)" }
+    $left = "  $glyph$($c.Reset) $($c.Bold)$Title$($c.Reset)"
+    $pad = [Math]::Max(1, (Get-Width) - 2 - (Strip $left).Length - $dur.Length)
+    Write-Host ""
+    Write-Host ($left + (' ' * $pad) + "$($c.Dim)$dur$($c.Reset)")
+    Write-Host ""
+    foreach ($r in $Rows) {
+        $k, $v = $r -split '=', 2
+        Write-Host ("      $($c.Dim)$($k.PadRight(10))$($c.Reset)$v")
+    }
+    Write-Host ""
 }
 
 # ==========================================================================
 # Elevated phase
 # ==========================================================================
 if ($ElevatedPhase) {
-    if (-not (Test-IsElevated)) { Write-Log "Elevated phase started without administrator rights" 'ERROR'; exit $ExitNeedsAdmin }
-    $Script:Steps = if ($CleanOnly) { 5 } else { 6 }
+    if (-not (Test-IsElevated)) { Write-Log "elevated phase started without administrator rights" 'ERROR'; exit $ExitNeedsAdmin }
     Stop-ClaudeDesktopProcesses
     $svcState = Remove-CoworkService
     $policyOk = Enable-SideloadingPolicy
     Remove-ClaudePackages
     Clear-Leftovers $PurgeUserData.IsPresent $Script:PendingMsix
-    if ($CleanOnly) { Write-Log "Cleanup finished (-CleanOnly)" 'OK'; exit $(if ($svcState -eq 'pending') { $ExitRebootNeeded } else { $ExitOk }) }
+    if ($CleanOnly) { Complete-Step; exit $(if ($svcState -eq 'pending') { $ExitRebootNeeded } else { $ExitOk }) }
     if ($svcState -eq 'pending') {
-        Write-Log "Skipping installation: the stale service entry disappears only after a reboot" 'ERROR'
-        exit $ExitRebootNeeded
+        Write-Log "installation skipped: the stale service entry disappears only after a reboot" 'ERROR'
+        Complete-Step; exit $ExitRebootNeeded
     }
-    if (-not (Test-Path $Script:PendingMsix)) { Write-Log "No package queued at $Script:PendingMsix" 'ERROR'; exit $ExitInstallFailed }
+    if (-not (Test-Path $Script:PendingMsix)) { Write-Log "no package queued at $Script:PendingMsix" 'ERROR'; Complete-Step; exit $ExitInstallFailed }
     if (-not (Install-Package $Script:PendingMsix)) {
+        Complete-Step
         if (-not $policyOk) { exit $ExitPolicyBlocked }
         if ($Script:LastInstallError -match '0x80073CF6') { exit $ExitRebootNeeded }
         exit $ExitInstallFailed
     }
     $pkg = Get-AppxPackage -Name '*Claude*' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $pkg) { Write-Log "Package not found after installation" 'ERROR'; exit $ExitInstallFailed }
-    Write-Log "Installed version $($pkg.Version)" 'OK'
+    if (-not $pkg) { Write-Log "package not found after installation" 'ERROR'; Complete-Step; exit $ExitInstallFailed }
+    Write-Log "installed version $($pkg.Version)" 'OK'
+    Complete-Step
     exit $ExitOk
 }
 
 # ==========================================================================
 # User phase
 # ==========================================================================
-$Script:Steps = 3
+Write-Log "Inspecting installation" 'STEP'
 $before = Get-AppxPackage -Name '*Claude*' -ErrorAction SilentlyContinue | Select-Object -First 1
-Write-Log "Inspecting current installation" 'STEP'
-if ($before) { Write-Log "Installed: $($before.Version) (status $($before.Status))" 'DETAIL' } else { Write-Log "Claude Desktop is not installed" 'DETAIL' }
+if ($before) { Write-Log "installed $($before.Version), status $($before.Status)" 'OK' } else { Write-Log "Claude Desktop is not installed" 'OK' }
 
-if ($CleanOnly) { exit (Invoke-ElevatedPhase $null) }
+if ($CleanOnly) { $rc = Invoke-ElevatedPhase $null; Complete-Step; exit $rc }
 
+Write-Log "Resolving latest release" 'STEP'
 $latest = Resolve-LatestRelease
 if (-not $latest) {
-    Write-Log "Could not resolve the latest release (network or proxy problem)" 'ERROR'
+    Write-Log "could not resolve the latest release (network or proxy problem)" 'ERROR'
+    Write-Outcome $false "Update did not complete" @("reason=the release endpoint could not be reached", "log=$Script:LogPath")
     if (-not $NoLaunch) { Start-Process 'https://claude.ai/download' }
     exit $ExitDownloadFail
 }
-Write-Log "Latest release: $($latest.Version) ($($latest.Arch))" 'OK'
+Write-Log "$($latest.Version) for $($latest.Arch)" 'OK'
 Write-Log $latest.Url 'DETAIL'
 
 $healthy = -not ($before -and $before.Status -and $before.Status -ne 'Ok')
-if (-not $healthy) { Write-Log "Installed package is in state '$($before.Status)', reinstalling" 'WARN' }
+if (-not $healthy) { Write-Log "installed package is in state '$($before.Status)', reinstalling" 'WARN' }
 if ($before -and $healthy -and -not $Force -and (Compare-Version $before.Version $latest.Version)) {
-    Write-Log "Already up to date ($($before.Version)); use -Force to reinstall" 'OK'
+    Write-Log "already up to date, use -Force to reinstall" 'OK'
+    Write-Outcome $true "Already up to date" @("installed=$($before.Version)", "latest=$($latest.Version)", "log=$Script:LogPath")
     if (-not $NoLaunch) { Start-ClaudeDesktop }
     exit $ExitOk
 }
 
-Write-Log "Fetching package" 'STEP'
+Write-Log "Downloading package" 'STEP'
 $msix = Join-Path $env:TEMP ("Claude-{0}.msix" -f $latest.Version)
 $reuse = $false
 if (Test-Path $Script:PendingMsix) {
     try {
         $sig = Get-AuthenticodeSignature -FilePath $Script:PendingMsix -ErrorAction Stop
         if ($sig.Status -eq 'Valid' -and $sig.SignerCertificate.Subject -match 'Anthropic' -and (Get-Item $Script:PendingMsix).Length -gt 100MB) {
-            Write-Log "Reusing the package left from the previous attempt" 'OK'; $msix = $Script:PendingMsix; $reuse = $true
+            Write-Log "reusing the package kept from the previous attempt" 'OK'; $msix = $Script:PendingMsix; $reuse = $true
         }
     } catch {}
     if (-not $reuse) { Remove-Item $Script:PendingMsix -Force -ErrorAction SilentlyContinue }
 }
 if (-not $reuse -and -not (Get-Package $latest.Url $msix)) {
-    Write-Log "Download failed" 'ERROR'
+    Write-Log "download failed" 'ERROR'
+    Write-Outcome $false "Update did not complete" @("reason=the package could not be downloaded", "log=$Script:LogPath")
     if (-not $NoLaunch) { Start-Process 'https://claude.ai/download' }
     exit $ExitDownloadFail
 }
-if (-not (Test-Signature $msix)) { Remove-Item $msix -Force -ErrorAction SilentlyContinue; exit $ExitDownloadFail }
+if (-not (Test-Signature $msix)) {
+    Remove-Item $msix -Force -ErrorAction SilentlyContinue
+    Write-Outcome $false "Update did not complete" @("reason=the downloaded package failed signature verification", "log=$Script:LogPath")
+    exit $ExitDownloadFail
+}
 
 $rc = Invoke-ElevatedPhase $msix
 if ($rc -ne $ExitOk) {
     $why = switch ($rc) {
-        3 { 'elevation was refused' }
+        3 { 'the UAC prompt was refused' }
         4 { 'sideloading is blocked by device management' }
-        5 { 'a reboot is required to finish removing the stale CoworkVMService; restart Windows and run the updater again' }
-        default { 'installation failed' } }
-    Write-Log "Update did not complete: $why (exit $rc). The downloaded package is kept for the next run." 'ERROR'
-    Write-Log "Log: $Script:LogPath" 'DETAIL'
+        5 { 'a reboot is required to finish removing the stale CoworkVMService; restart and run again' }
+        default { 'the elevated installation failed, see the log' } }
+    Write-Log "update did not complete: $why (exit $rc)" 'ERROR'
+    Write-Outcome $false "Update did not complete" @("reason=$why", "package=kept for the next run", "log=$Script:LogPath")
     exit $rc
 }
 Remove-Item -Path $Script:PendingMsix -Force -ErrorAction SilentlyContinue
 
 $after = Get-AppxPackage -Name '*Claude*' -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $after) { Write-Log "Package not found after installation" 'ERROR'; exit $ExitInstallFailed }
+if (-not $after) {
+    Write-Log "package not found after installation" 'ERROR'
+    Write-Outcome $false "Update did not complete" @("reason=the package is not registered after installation", "log=$Script:LogPath")
+    exit $ExitInstallFailed
+}
+Write-Log "installed $($after.Version)" 'OK'
 if (-not $NoLaunch) { Start-ClaudeDesktop }
 
-$c = $Script:C; $g = $Script:G
 $prev = if ($before) { $before.Version } else { 'not installed' }
-Write-Host ""
-Write-Host "  $($c.Green)$($c.Bold)$($g.Ok) UPDATE COMPLETE$($c.Reset)"
-Write-Host "  $($c.Grey)$([string]$g.H * 44)$($c.Reset)"
-Write-Host "    $($c.Grey)previous version $($c.Reset) $prev"
-Write-Host "    $($c.Grey)installed version$($c.Reset) $($c.Bold)$($c.White)$($after.Version)$($c.Reset)"
-Write-Host "    $($c.Grey)user data        $($c.Reset) $(if ($PurgeUserData) {'purged'} else {'preserved'})"
-Write-Host "    $($c.Grey)log              $($c.Reset) $($c.Dim)$Script:LogPath$($c.Reset)"
-Write-Host "  $($c.Grey)$([string]$g.H * 44)$($c.Reset)"
-Write-Host ""
 Write-Log "SUMMARY: $prev -> $($after.Version)" -NoConsole
+Write-Outcome $true "Update complete" @("previous=$prev", "installed=$($after.Version)", "user data=$(if ($PurgeUserData) {'purged'} else {'preserved'})", "log=$Script:LogPath")
 exit $ExitOk
